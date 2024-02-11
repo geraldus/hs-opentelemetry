@@ -4,6 +4,8 @@
 module OpenTelemetry.Instrumentation.Wai (
   newOpenTelemetryWaiMiddleware,
   newOpenTelemetryWaiMiddleware',
+  newOpenTelemetryWaiMiddlewareWithAttrs,
+  newOpenTelemetryWaiMiddlewareWithAttrs',
   requestContext,
 ) where
 
@@ -25,13 +27,29 @@ import System.IO.Unsafe
 
 
 newOpenTelemetryWaiMiddleware :: IO Middleware
-newOpenTelemetryWaiMiddleware = getGlobalTracerProvider >>= newOpenTelemetryWaiMiddleware'
+newOpenTelemetryWaiMiddleware =
+  getGlobalTracerProvider >>= newOpenTelemetryWaiMiddleware'
+
+
+newOpenTelemetryWaiMiddlewareWithAttrs
+  :: [(T.Text, Attribute)] -> IO Middleware
+newOpenTelemetryWaiMiddlewareWithAttrs attrs =
+  getGlobalTracerProvider
+    >>= (\tp -> newOpenTelemetryWaiMiddlewareWithAttrs' tp attrs)
 
 
 newOpenTelemetryWaiMiddleware'
   :: TracerProvider
   -> IO Middleware
-newOpenTelemetryWaiMiddleware' tp = do
+newOpenTelemetryWaiMiddleware' tp =
+  newOpenTelemetryWaiMiddlewareWithAttrs' tp []
+
+
+newOpenTelemetryWaiMiddlewareWithAttrs'
+  :: TracerProvider
+  -> [(T.Text, Attribute)]
+  -> IO Middleware
+newOpenTelemetryWaiMiddlewareWithAttrs' tp extraAttrs = do
   let waiTracer =
         makeTracer
           tp
@@ -51,6 +69,7 @@ newOpenTelemetryWaiMiddleware' tp = do
       parentContextM
       inSpan' tracer path_ (defaultSpanArguments {kind = Server}) $ \requestSpan -> do
         ctxt <- getContext
+        addAttributes requestSpan extraAttrs
         addAttributes
           requestSpan
           [ ("http.method", toAttribute $ T.decodeUtf8 $ requestMethod req)
@@ -107,7 +126,7 @@ newOpenTelemetryWaiMiddleware' tp = do
           forM_ (lookupAttribute attrs "http.route") $ \case
             AttributeValue (TextAttribute route) -> updateName requestSpan route
             _ -> pure ()
-
+          addAttributes requestSpan extraAttrs
           addAttributes
             requestSpan
             [ ("http.status_code", toAttribute $ statusCode $ responseStatus resp)
