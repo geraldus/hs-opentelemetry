@@ -1,6 +1,6 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.35.2.
+-- This file has been generated from package.yaml by hpack version 0.36.0.
 --
 -- see: https://github.com/sol/hpack
 
@@ -28,6 +28,10 @@ source-repository head
 library
   exposed-modules:
       OpenTelemetry.Exporter.OTLP
+      OpenTelemetry.Proto.Collector.Trace.V1.TraceService
+      OpenTelemetry.Proto.Common.V1.Common
+      OpenTelemetry.Proto.Resource.V1.Resource
+      OpenTelemetry.Proto.Trace.V1.Trace
   other-modules:
       Paths_hs_opentelemetry_exporter_otlp
   hs-source-dirs:
@@ -38,6 +42,9 @@ library
     , bytestring
     , case-insensitive
     , clock
+    , containers
+    , deepseq
+    , grpc-haskell
     , hs-opentelemetry-api >=0.0.3 && <0.2
     , hs-opentelemetry-otlp ==0.0.1.*
     , http-client
@@ -46,6 +53,8 @@ library
     , microlens
     , mtl
     , proto-lens >=0.7.1.0
+    , proto3-suite
+    , proto3-wire
     , text
     , unordered-containers
     , vector
@@ -66,6 +75,9 @@ test-suite hs-opentelemetry-exporter-otlp-test
     , bytestring
     , case-insensitive
     , clock
+    , containers
+    , deepseq
+    , grpc-haskell
     , hs-opentelemetry-api >=0.0.3 && <0.2
     , hs-opentelemetry-exporter-otlp
     , hs-opentelemetry-otlp ==0.0.1.*
@@ -75,6 +87,8 @@ test-suite hs-opentelemetry-exporter-otlp-test
     , microlens
     , mtl
     , proto-lens >=0.7.1.0
+    , proto3-suite
+    , proto3-wire
     , text
     , unordered-containers
     , vector

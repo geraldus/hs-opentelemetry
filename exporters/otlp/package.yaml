@@ -26,12 +26,17 @@ dependencies:
 - text
 - bytestring
 - case-insensitive
+- containers
+- deepseq
+- grpc-haskell
 - http-types
 - http-client
 - http-conduit
 - mtl
 - vector
 - vector-builder
+- proto3-suite
+- proto3-wire
 - proto-lens >= 0.7.1.0
 - microlens
 - clock
