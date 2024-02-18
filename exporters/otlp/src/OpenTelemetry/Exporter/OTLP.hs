@@ -1,8 +1,11 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -----------------------------------------------------------------------------
@@ -85,6 +88,11 @@ import Proto.Opentelemetry.Proto.Trace.V1.Trace (InstrumentationLibrarySpans, Sp
 import Proto.Opentelemetry.Proto.Trace.V1.Trace_Fields
 import System.Environment
 import Text.Read (readMaybe)
+import qualified OpenTelemetry.Proto.Collector.Trace.V1.TraceService as GrpcClient
+import qualified Proto3.Suite.Class as Proto3
+import qualified Proto3.Suite as Proto3
+import qualified Proto3.Wire.Decode as Proto3
+import qualified Network.GRPC.HighLevel.Generated as Grpc
 
 
 data CompressionFormat = None | GZip
@@ -198,6 +206,138 @@ protobufMimeType = "application/x-protobuf"
 -- | Initial the OTLP 'Exporter'
 otlpExporter :: (MonadIO m) => OTLPExporterConfig -> m (Exporter OT.ImmutableSpan)
 otlpExporter conf = do
+  -- TODO, url parsing is janky
+  -- TODO configurable retryDelay, maximum retry counts
+  let
+    defaultHost = "http://localhost:4318"
+    host = fromMaybe defaultHost $ otlpEndpoint conf
+  req <- liftIO $ parseRequest (host <> "/v1/traces")
+
+  let (encodingHeader, encoder) =
+        maybe
+          (id, id)
+          ( \case
+              None -> (id, id)
+              GZip -> (((hContentEncoding, "gzip") :), compress)
+          )
+          (otlpTracesCompression conf <|> otlpCompression conf)
+
+      baseReqHeaders =
+        encodingHeader $
+          (hContentType, protobufMimeType)
+            : (hAcceptEncoding, protobufMimeType)
+            : fromMaybe [] (otlpHeaders conf)
+            ++ fromMaybe [] (otlpTracesHeaders conf)
+            ++ requestHeaders req
+      baseReq =
+        req
+          { method = "POST"
+          , requestHeaders = baseReqHeaders
+          }
+  pure $
+    Exporter
+      { exporterExport = \spans_ -> do
+          let anySpansToExport = H.size spans_ /= 0 && not (all V.null $ H.elems spans_)
+          if anySpansToExport
+            then do
+              result <- try $ exporterExportCall encoder baseReq spans_
+              case result of
+                Left err -> do
+                  -- If the exception is async, then we need to rethrow it
+                  -- here. Otherwise, there's a good chance that the
+                  -- calling code will swallow the exception and cause
+                  -- a problem.
+                  case fromException err of
+                    Just (SomeAsyncException _) -> do
+                      throwIO err
+                    Nothing ->
+                      pure $ Failure $ Just err
+                Right ok -> pure ok
+            else pure Success
+      , exporterShutdown = pure ()
+      }
+  where
+    retryDelay = 100_000 -- 100ms
+    maxRetryCount = 5
+    isRetryableStatusCode status_ =
+      status_ == status408 || status_ == status429 || (statusCode status_ >= 500 && statusCode status_ < 600)
+    isRetryableException = \case
+      ResponseTimeout -> True
+      ConnectionTimeout -> True
+      ConnectionFailure _ -> True
+      ConnectionClosed -> True
+      _ -> False
+
+    exporterExportCall encoder baseReq spans_ = do
+      msg <- encodeMessage <$> immutableSpansToProtobuf spans_
+      let
+          grpcMsg :: GrpcClient.ExportTraceServiceRequest
+          grpcMsg =
+            either
+              (const $ error "FAILURE! ")
+              id
+              (Proto3.parse (Proto3.decodeMessage (Proto3.fieldNumber 1)) msg)
+
+      -- TODO handle server disconnect
+      sendReq grpcMsg 0 -- TODO =<< getTime for maximum cutoff
+
+    clientConfig :: Grpc.ClientConfig
+    clientConfig = Grpc.ClientConfig { clientServerEndpoint = "localhost:4317"
+                                , clientArgs = []
+                                , clientSSLConfig = Nothing
+                                , clientAuthority = Nothing
+                                }
+
+    sendReq msg backoffCount = do
+      Grpc.withGRPCClient clientConfig $ \client -> do
+        GrpcClient.TraceService{..} <- GrpcClient.traceServiceClient client
+        Grpc.ClientNormalResponse _ _meta1 _meta2 _status _details <-
+          traceServiceExport (Grpc.ClientNormalRequest msg 1 [])
+        pure Success
+
+      -- eResp <- try $  httpBS req
+
+      -- let exponentialBackoff =
+      --       if backoffCount == maxRetryCount
+      --         then pure $ Failure Nothing
+      --         else do
+      --           threadDelay (retryDelay `shiftL` backoffCount)
+      --           sendReq req (backoffCount + 1)
+
+      -- case eResp of
+      --   Left err@(HttpExceptionRequest req e)
+      --     | HTTPClient.host req == "localhost"
+      --     , HTTPClient.port req == 4317 || HTTPClient.port req == 4318
+      --     , ConnectionFailure _someExn <- e
+      --       -> do
+      --         pure $ Failure Nothing
+      --     | otherwise ->
+      --       if isRetryableException e
+      --         then exponentialBackoff
+      --         else pure $ Failure $ Just $ SomeException err
+      --   Left err -> do
+      --     pure $ Failure $ Just $ SomeException err
+      --   Right resp ->
+      --     if isRetryableStatusCode (responseStatus resp)
+      --       then case lookup hRetryAfter $ responseHeaders resp of
+      --         Nothing -> exponentialBackoff
+      --         Just retryAfter -> do
+      --           -- TODO support date in retry-after header
+      --           case readMaybe $ C.unpack retryAfter of
+      --             Nothing -> exponentialBackoff
+      --             Just seconds -> do
+      --               threadDelay (seconds * 1_000_000)
+      --               sendReq req (backoffCount + 1)
+      --       else
+      --         if statusCode (responseStatus resp) >= 300
+      --           then do
+      --             print resp
+      --             pure $ Failure Nothing
+      --           else pure Success
+
+-- | Initial the OTLP 'Exporter'
+otlpExporter' :: (MonadIO m) => OTLPExporterConfig -> m (Exporter OT.ImmutableSpan)
+otlpExporter' conf = do
   -- TODO, url parsing is janky
   -- TODO configurable retryDelay, maximum retry counts
   let
@@ -377,6 +517,50 @@ immutableSpansToProtobuf completedSpans = do
                )
           & vec'spans .~ spans_
 
+-- immutableSpansToGrpcProtobuf ::
+--   (MonadIO m) => HashMap OT.InstrumentationLibrary (Vector OT.ImmutableSpan) ->
+--   m GrpcClient.ExportTraceServiceRequest
+-- immutableSpansToGrpcProtobuf completedSpans = do
+--   spansByLibrary <- mapM makeInstrumentationLibrarySpans spanGroupList
+--   pure $
+--     defMessage
+--       & vec'resourceSpans
+--         .~ Vector.singleton
+--           ( defMessage
+--               & resource
+--                 .~ ( defMessage
+--                       & vec'attributes .~ attributesToProto (getMaterializedResourcesAttributes someResourceGroup)
+--                       -- TODO
+--                       & droppedAttributesCount .~ 0
+--                    )
+--               -- TODO, seems like spans need to be emitted via an API
+--               -- that lets us keep them grouped by instrumentation originator
+--               & instrumentationLibrarySpans .~ spansByLibrary
+--           )
+--   where
+--     -- TODO this won't work right if multiple TracerProviders are exporting to a single OTLP exporter with different resources
+--     someResourceGroup = case spanGroupList of
+--       [] -> emptyMaterializedResources
+--       ((_, r) : _) -> case r V.!? 0 of
+--         Nothing -> emptyMaterializedResources
+--         Just s -> OT.getTracerProviderResources $ OT.getTracerTracerProvider $ OT.spanTracer s
+
+--     spanGroupList = H.toList completedSpans
+
+--     makeInstrumentationLibrarySpans ::
+--       (MonadIO m) => (OT.InstrumentationLibrary, Vector OT.ImmutableSpan) ->
+--       m GrpcClient.InstrumentationLibrarySpans
+--     makeInstrumentationLibrarySpans (library, completedSpans_) = do
+--       spans_ <- mapM makeSpan completedSpans_
+--       pure $
+--         defMessage
+--           & instrumentationLibrary
+--             .~ ( defMessage
+--                   & Proto.Opentelemetry.Proto.Trace.V1.Trace_Fields.name .~ OT.libraryName library
+--                   & version .~ OT.libraryVersion library
+--                )
+--           & vec'spans .~ spans_
+
 
 -- & schemaUrl .~ "" -- TODO
 
@@ -426,6 +610,54 @@ makeSpan completedSpan = do
                   & message .~ e
            )
       & parentSpanF
+
+-- makeGrpcSpan :: (MonadIO m) => OT.ImmutableSpan -> m GrpcClient.Span
+-- makeGrpcSpan completedSpan = do
+--   let startTime = timestampNanoseconds (OT.spanStart completedSpan)
+--   parentSpanF <- do
+--     case OT.spanParent completedSpan of
+--       Nothing -> pure id
+--       Just s -> do
+--         spanCtxt <- OT.spanId <$> OT.getSpanContext s
+--         pure (\otlpSpan -> otlpSpan & parentSpanId .~ spanIdBytes spanCtxt)
+
+--   pure $
+--     GrpcClient.Span
+--       { spanTraceId = traceIdBytes (OT.traceId $ OT.spanContext completedSpan)
+--       , spanSpanId .~ spanIdBytes (OT.spanId $ OT.spanContext completedSpan)
+--       , spanTraceState .~ "" -- TODO (_ $ OT.traceState $ OT.spanContext completedSpan)
+--       , spanProto.Opentelemetry.Proto.Trace.V1.Trace_Fields.name .~ OT.spanName completedSpan
+--       , spanKind
+--         .~ ( case OT.spanKind completedSpan of
+--               OT.Server -> Span'SPAN_KIND_SERVER
+--               OT.Client -> Span'SPAN_KIND_CLIENT
+--               OT.Producer -> Span'SPAN_KIND_PRODUCER
+--               OT.Consumer -> Span'SPAN_KIND_CONSUMER
+--               OT.Internal -> Span'SPAN_KIND_INTERNAL
+--            )
+--       , spanStartTimeUnixNano .~ startTime
+--       , spanEndTimeUnixNano .~ maybe startTime timestampNanoseconds (OT.spanEnd completedSpan)
+--       , spanVec'attributes .~ attributesToProto (OT.spanAttributes completedSpan)
+--       , spanDroppedAttributesCount .~ fromIntegral (fst (getAttributes $ OT.spanAttributes completedSpan))
+--       , spanVec'events .~ fmap makeEvent (appendOnlyBoundedCollectionValues $ OT.spanEvents completedSpan)
+--       , spanDroppedEventsCount .~ fromIntegral (appendOnlyBoundedCollectionDroppedElementCount (OT.spanEvents completedSpan))
+--       , spanVec'links .~ fmap makeLink (frozenBoundedCollectionValues $ OT.spanLinks completedSpan)
+--       , spanDroppedLinksCount .~ fromIntegral (frozenBoundedCollectionDroppedElementCount (OT.spanLinks completedSpan))
+--       , spanStatus
+--         .~ ( case OT.spanStatus completedSpan of
+--               OT.Unset ->
+--                 defMessage
+--                   & code .~ Status'STATUS_CODE_UNSET
+--               OT.Ok ->
+--                 defMessage
+--                   & code .~ Status'STATUS_CODE_OK
+--               (OT.Error e) ->
+--                 defMessage
+--                   & code .~ Status'STATUS_CODE_ERROR
+--                   & message .~ e
+--            )
+--       }
+--       -- , parentSpanF }
 
 
 makeEvent :: OT.Event -> Span'Event
