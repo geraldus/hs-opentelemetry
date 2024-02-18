@@ -5,16 +5,18 @@
 module OpenTelemetry.Instrumentation.Wai (
   newOpenTelemetryWaiMiddleware,
   newOpenTelemetryWaiMiddleware',
+  newOpenTelemetryWaiMiddlewareWithAttrs,
+  newOpenTelemetryWaiMiddlewareWithAttrs',
   requestContext,
 ) where
 
-import Control.Exception (bracket)
 import Control.Monad
+import qualified Data.HashMap.Strict as H
 import Data.IP (fromHostAddress, fromHostAddress6)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Vault.Lazy as Vault
-import GHC.Stack (HasCallStack, callStack, popCallStack)
+import GHC.Stack (HasCallStack)
 import Network.HTTP.Types
 import Network.Socket
 import Network.Wai
@@ -29,11 +31,32 @@ import System.IO.Unsafe
 newOpenTelemetryWaiMiddleware :: (HasCallStack) => IO Middleware
 newOpenTelemetryWaiMiddleware = newOpenTelemetryWaiMiddleware' <$> getGlobalTracerProvider
 
+
+{- | Same as 'newOpenTelemetryWaiMiddleware' but allows the passing of a
+set of custom attributes to be injected into all spans created by the
+middleware.
+-}
+newOpenTelemetryWaiMiddlewareWithAttrs
+  :: (HasCallStack) => H.HashMap T.Text Attribute -> IO Middleware
+newOpenTelemetryWaiMiddlewareWithAttrs extraAttrs =
+  newOpenTelemetryWaiMiddlewareWithAttrs' extraAttrs <$> getGlobalTracerProvider
+
+
 newOpenTelemetryWaiMiddleware'
   :: (HasCallStack)
   => TracerProvider
   -> Middleware
-newOpenTelemetryWaiMiddleware' tp =
+newOpenTelemetryWaiMiddleware' = newOpenTelemetryWaiMiddlewareWithAttrs' []
+
+
+newOpenTelemetryWaiMiddlewareWithAttrs'
+  :: (HasCallStack)
+  => H.HashMap T.Text Attribute
+  -- ^ a set of additional attributes that are added to all request and
+  -- response spans
+  -> TracerProvider
+  -> Middleware
+newOpenTelemetryWaiMiddlewareWithAttrs' extraAttrs tp =
   let waiTracer =
         makeTracer
           tp
@@ -51,9 +74,10 @@ newOpenTelemetryWaiMiddleware' tp =
             attachContext ctxt
       let path_ = T.decodeUtf8 $ rawPathInfo req
       -- peer = remoteHost req
-      parentContextM
+      void parentContextM
       inSpan'' tracer path_ (defaultSpanArguments {kind = Server, attributes = usefulCallsite}) $ \requestSpan -> do
         ctxt <- getContext
+        addAttributes requestSpan extraAttrs
         addAttributes
           requestSpan
           [ ("http.method", toAttribute $ T.decodeUtf8 $ requestMethod req)
@@ -111,6 +135,7 @@ newOpenTelemetryWaiMiddleware' tp =
             AttributeValue (TextAttribute route) -> updateName requestSpan route
             _ -> pure ()
 
+          addAttributes requestSpan extraAttrs
           addAttributes
             requestSpan
             [ ("http.status_code", toAttribute $ statusCode $ responseStatus resp)
